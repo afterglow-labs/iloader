@@ -1,15 +1,7 @@
 name: "Build iloader"
 
 on:
-  push:
-    branches:
-      - "*"
-  pull_request:
-    branches:
-      - "*"
   workflow_dispatch:
-  release:
-    types: [published]
 
 jobs:
   build:
