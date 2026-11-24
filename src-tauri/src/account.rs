@@ -6,10 +6,13 @@ use isideload::{
         app_ids::{AppIdsApi, ListAppIdsResponse},
         certificates::{CertificatesApi, DevelopmentCertificate},
         developer_session::DeveloperSession,
+        teams::DeveloperTeam,
     },
     sideload::{
         SideloaderBuilder,
-        builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
+        builder::{
+            ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior, TeamSelection,
+        },
         sideloader::Sideloader,
     },
     util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
@@ -18,8 +21,8 @@ use keyring::Entry;
 use rootcause::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
-use tauri::{AppHandle, Emitter, Listener, State, Window};
+use std::{cell::RefCell, sync::mpsc, time::Duration};
+use tauri::{AppHandle, Emitter, Listener, State, Window, ipc::Channel};
 use tauri_plugin_store::StoreExt;
 use tracing::debug;
 
@@ -38,10 +41,17 @@ pub async fn login_new(
     password: String,
     anisette_server: String,
     save_credentials: bool,
+    on_team_selection: Channel<TeamSelectionRequest>,
 ) -> Result<(), AppError> {
-    let account = login(&handle, window, &email, &password, anisette_server).await?;
-    let mut sideloader_guard = sideloader_state.lock().unwrap();
-    *sideloader_guard = Some(account);
+    let account = login(
+        &handle,
+        window,
+        &email,
+        &password,
+        anisette_server,
+        on_team_selection,
+    )
+    .await?;
 
     if save_credentials {
         let pass_entry = Entry::new("iloader", &email).map_err(|e| {
@@ -68,6 +78,7 @@ pub async fn login_new(
         }
         store.set("ids", Value::Array(existing_ids));
     }
+    *sideloader_state.lock().unwrap() = Some(account);
     Ok(())
 }
 
@@ -78,6 +89,7 @@ pub async fn login_stored(
     email: String,
     anisette_server: String,
     sideloader_state: State<'_, SideloaderMutex>,
+    on_team_selection: Channel<TeamSelectionRequest>,
 ) -> Result<(), AppError> {
     let pass_entry = Entry::new("iloader", &email).map_err(|e| {
         AppError::KeyringWithMessage(
@@ -88,7 +100,15 @@ pub async fn login_stored(
     let password = pass_entry.get_password().map_err(|e| {
         AppError::KeyringWithMessage("Failed to get credentials".to_string(), e.to_string())
     })?;
-    let account = login(&handle, window, &email, &password, anisette_server).await?;
+    let account = login(
+        &handle,
+        window,
+        &email,
+        &password,
+        anisette_server,
+        on_team_selection,
+    )
+    .await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
     *sideloader_guard = Some(account);
 
@@ -165,6 +185,7 @@ async fn login(
     email: &str,
     password: &str,
     anisette_server: String,
+    on_team_selection: Channel<TeamSelectionRequest>,
 ) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
     let tfa_closure = {
         let window_clone = window.clone();
@@ -221,9 +242,10 @@ async fn login(
 
     debug!("Created developer session");
 
+    let cert_window = window.clone();
     let max_certs_callback: MaxCertsCallbackBox =
         Box::new(move |certs: Vec<DevelopmentCertificate>| {
-            let window_clone = window.clone();
+            let window_clone = cert_window.clone();
             Box::pin(async move {
                 let cert_infos: Vec<CertificateInfo> = certs
                     .iter()
@@ -250,20 +272,107 @@ async fn login(
             })
         });
 
-    // TODO: Team Selection
-
-    let sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
+    let mut sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
         .machine_name("iloader".into())
         .storage(create_sideloading_storage(app)?)
+        .team_selection(TeamSelection::PromptOnce(prompt_for_team))
         .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
             ExtensionsBehavior::ReuseMain,
         ))
         .max_certs_behavior(MaxCertsBehavior::Prompt(max_certs_callback))
         .build();
 
+    TEAM_PICKER
+        .scope(
+            TeamPicker {
+                window,
+                channel: on_team_selection,
+                error: RefCell::new(None),
+            },
+            async {
+                let result = sideloader.get_team().await;
+                if let Some(error) = TEAM_PICKER.with(|picker| picker.error.take()) {
+                    return Err(error);
+                }
+                result.map_err(AppError::from)
+            },
+        )
+        .await?;
+
     debug!("Built sideloader");
 
     Ok(sideloader)
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamSelectionRequest {
+    response_event: String,
+    teams: Vec<TeamInfo>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamInfo {
+    team_id: String,
+    name: Option<String>,
+    kind: Option<String>,
+}
+
+struct TeamPicker {
+    window: Window,
+    channel: Channel<TeamSelectionRequest>,
+    error: RefCell<Option<AppError>>,
+}
+
+tokio::task_local! {
+    // isideload takes a function pointer, so keep the prompt context with this login task.
+    static TEAM_PICKER: TeamPicker;
+}
+
+fn prompt_for_team(teams: &Vec<DeveloperTeam>) -> Option<String> {
+    TEAM_PICKER.with(|picker| match picker.prompt(teams) {
+        Ok(team_id) => Some(team_id),
+        Err(error) => {
+            picker.error.replace(Some(error));
+            None
+        }
+    })
+}
+
+impl TeamPicker {
+    fn prompt(&self, teams: &[DeveloperTeam]) -> Result<String, AppError> {
+        let response_event = format!("team-selection-{}", uuid::Uuid::new_v4());
+        let (sender, receiver) = mpsc::channel();
+        let listener = self.window.listen(&response_event, move |event| {
+            if let Ok(response) = serde_json::from_str::<Option<String>>(event.payload()) {
+                let _ = sender.send(response);
+            }
+        });
+        let request = TeamSelectionRequest {
+            response_event,
+            teams: teams
+                .iter()
+                .map(|team| TeamInfo {
+                    team_id: team.team_id.clone(),
+                    name: team.name.clone(),
+                    kind: team.r#type.clone(),
+                })
+                .collect(),
+        };
+        let result = self
+            .channel
+            .send(request)
+            .map_err(|error| AppError::Misc(format!("Failed to show developer teams: {error}")))
+            .and_then(|()| {
+                tokio::task::block_in_place(|| receiver.recv_timeout(Duration::from_secs(300)))
+                    .map_err(|_| {
+                        AppError::Misc("Timed out waiting for a developer team selection".into())
+                    })
+            });
+        self.window.unlisten(listener);
+        result?.ok_or_else(|| AppError::Canceled("Sign-in".into()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

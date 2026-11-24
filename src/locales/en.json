@@ -75,6 +75,8 @@
     "verification_placeholder": "Verification Code...",
     "valid_6digit": "Please enter a valid 6-digit code.",
     "submit": "Submit",
+    "choose_developer_team": "Choose a developer team",
+    "team_selection_failed": "Could not submit your team selection. Please try again.",
     "max_certs_title": "Maximum certificates reached",
     "max_certs_desc": "iloader will revoke your existing certificates and generate a new one.",
     "hide_certificate_list": "Hide certificate list",

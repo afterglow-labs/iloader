@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import "./AppleID.css";
-import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { emit, emitTo, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { load } from "@tauri-apps/plugin-store";
 import { Modal } from "./components/Modal";
 import { toast } from "sonner";
@@ -9,8 +10,14 @@ import { useStore } from "./StoreContext";
 import { useError } from "./ErrorContext";
 import { Certificate } from "./pages/Certificates";
 import { useTranslation } from "react-i18next";
+import type { AppError } from "./errors";
 
 const storePromise = load("data.json");
+
+type TeamSelectionRequest = {
+  responseEvent: string;
+  teams: { teamId: string; name: string | null; kind: string | null }[];
+};
 
 export const AppleID = ({
   loggedInAs,
@@ -30,6 +37,10 @@ export const AppleID = ({
   const [tfaOpen, setTfaOpen] = useState<boolean>(false);
   const [tfaCode, setTfaCode] = useState<string>("");
   const [addAccountOpen, setAddAccountOpen] = useState<boolean>(false);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [teamRequest, setTeamRequest] =
+    useState<TeamSelectionRequest | null>(null);
+  const [selectedTeamId, setSelectedTeamId] = useState("");
   const [anisetteServer] = useStore<string>(
     "anisetteServer3-1",
     "mac-ani.jkcoxson.com",
@@ -38,6 +49,42 @@ export const AppleID = ({
   const [selectedSerials, setSelectedSerials] = useState<string[]>([]);
   const [chooseCertsOpen, setChooseCertsOpen] = useState<boolean>(false);
   const { err } = useError();
+
+  const signIn = async (
+    command: "login_new" | "login_stored",
+    args: { email: string; password?: string; saveCredentials?: boolean },
+  ) => {
+    if (isLoggingIn) return;
+    setIsLoggingIn(true);
+    const onTeamSelection = new Channel<TeamSelectionRequest>((request) => {
+      setSelectedTeamId("");
+      setTeamRequest(request);
+    });
+    const toastId = toast.loading(t("apple_id.logging_in"));
+    try {
+      await invoke(command, { ...args, anisetteServer, onTeamSelection });
+      setForceUpdateIds((v) => v + 1);
+      toast.success(t("apple_id.logged_in_success"), { id: toastId });
+    } catch (error) {
+      toast.dismiss(toastId);
+      if ((error as AppError)?.type !== "canceled") {
+        err(t("apple_id.login_failed"), error as AppError);
+      }
+    } finally {
+      setTeamRequest(null);
+      setIsLoggingIn(false);
+    }
+  };
+
+  const respondToTeamRequest = async (teamId: string | null) => {
+    if (!teamRequest) return;
+    try {
+      await emitTo(getCurrentWindow().label, teamRequest.responseEvent, teamId);
+      setTeamRequest(null);
+    } catch {
+      toast.error(t("apple_id.team_selection_failed"));
+    }
+  };
 
   useEffect(() => {
     let getLoggedInAs = async () => {
@@ -111,6 +158,7 @@ export const AppleID = ({
               <button
                 type="button"
                 className="action-button danger"
+                disabled={isLoggingIn}
                 onClick={async () => {
                   let promise = async () => {
                     await invoke("invalidate_account");
@@ -140,20 +188,10 @@ export const AppleID = ({
                       <button
                         type="button"
                         className="action-button primary"
-                        onClick={() => {
-                          let promise = async () => {
-                            await invoke("login_stored", {
-                              email: id,
-                              anisetteServer,
-                            });
-                            setForceUpdateIds((v) => v + 1);
-                          };
-                          toast.promise(promise, {
-                            loading: t("apple_id.logging_in"),
-                            success: t("apple_id.logged_in_success"),
-                            error: (e) => err(t("apple_id.login_failed"), e),
-                          });
-                        }}
+                        disabled={isLoggingIn}
+                        onClick={() =>
+                          void signIn("login_stored", { email: id })
+                        }
                       >
                         {t("apple_id.sign_in")}
                       </button>
@@ -161,6 +199,7 @@ export const AppleID = ({
                     <button
                       type="button"
                       className="action-button danger"
+                      disabled={isLoggingIn}
                       onClick={async () => {
                         let promise = async () => {
                           await invoke("delete_account", { email: id });
@@ -207,19 +246,10 @@ export const AppleID = ({
                 //   toast.warning(t("apple_id.valid_email"));
                 //   return;
                 // }
-                let promise = async () => {
-                  await invoke("login_new", {
-                    email: emailInput,
-                    password: passwordInput,
-                    saveCredentials: saveCredentials,
-                    anisetteServer,
-                  });
-                  setForceUpdateIds((v) => v + 1);
-                };
-                toast.promise(promise, {
-                  loading: t("apple_id.logging_in"),
-                  success: t("apple_id.logged_in_success"),
-                  error: (e) => err(t("apple_id.login_failed"), e),
+                await signIn("login_new", {
+                  email: emailInput,
+                  password: passwordInput,
+                  saveCredentials,
                 });
               }}
             >
@@ -252,9 +282,12 @@ export const AppleID = ({
                   </label>
                 </div>
               )}
-              <button type="submit">{t("apple_id.login")}</button>
+              <button type="submit" disabled={isLoggingIn}>
+                {t("apple_id.login")}
+              </button>
               {addAccountOpen && storedIds.length > 0 && (
                 <button
+                  type="button"
                   onClick={() => {
                     setAddAccountOpen(false);
                   }}
@@ -289,6 +322,54 @@ export const AppleID = ({
             style={{ marginRight: "0.5em" }}
           />
           <button type="submit">{t("apple_id.submit")}</button>
+        </form>
+      </Modal>
+      <Modal sizeFit isOpen={teamRequest !== null} zIndex={2000}>
+        <form
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="team-selection-title"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (selectedTeamId) void respondToTeamRequest(selectedTeamId);
+          }}
+        >
+          <h2 id="team-selection-title" className="cert-header">
+            {t("apple_id.choose_developer_team")}
+          </h2>
+          <select
+            className="team-select"
+            aria-labelledby="team-selection-title"
+            value={selectedTeamId}
+            onChange={(event) => setSelectedTeamId(event.target.value)}
+            autoFocus
+            required
+          >
+            <option value="" disabled>
+              {t("dropdown.select")}
+            </option>
+            {teamRequest?.teams.map(({ teamId, name, kind }) => (
+              <option key={teamId} value={teamId}>
+                {[name, kind, teamId].filter(Boolean).join(" · ")}
+              </option>
+            ))}
+          </select>
+          <div className="action-row team-selection-actions">
+            <button
+              type="submit"
+              className="action-button primary"
+              disabled={!selectedTeamId}
+            >
+              {t("apple_id.continue")}
+            </button>
+            <button
+              type="button"
+              className="action-button danger"
+              onClick={() => void respondToTeamRequest(null)}
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
         </form>
       </Modal>
       <Modal sizeFit isOpen={certs !== null} zIndex={2000}>
