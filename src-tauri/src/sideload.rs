@@ -6,14 +6,18 @@ use crate::{
     operation::Operation,
     pairing::{get_sidestore_info, place_file},
 };
-use isideload::sideload::{application::SpecialApp, sideloader::Sideloader};
+use isideload::{
+    sideload::{application::SpecialApp, sideloader::Sideloader},
+    util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
+};
 use tauri::{AppHandle, Manager, State, Window};
 
-pub type SideloaderMutex = Mutex<Option<Sideloader>>;
+pub type SideloaderMutex =
+    Mutex<Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>>;
 
 pub struct SideloaderGuard<'a> {
     state: &'a SideloaderMutex,
-    sideloader: Option<Sideloader>,
+    sideloader: Option<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>>,
 }
 
 impl<'a> SideloaderGuard<'a> {
@@ -26,7 +30,9 @@ impl<'a> SideloaderGuard<'a> {
         })
     }
 
-    pub fn get_mut(&mut self) -> &mut Sideloader {
+    pub fn get_mut(
+        &mut self,
+    ) -> &mut Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox> {
         self.sideloader
             .as_mut()
             .expect("Sideloader should be present")
@@ -59,7 +65,13 @@ pub async fn sideload(
 
     let special = sideloader
         .get_mut()
-        .install_app(&provider, app_path.into(), false)
+        .install_app(
+            &provider,
+            app_path.into(),
+            true,
+            None::<fn(f32) -> std::future::Ready<()>>,
+            Some(&device.pairing),
+        )
         .await?;
 
     Ok(special)

@@ -1,14 +1,21 @@
+use futures::FutureExt;
 use isideload::{
-    anisette::remote_v3::RemoteV3AnisetteProvider,
-    auth::apple_account::AppleAccount,
+    anisette::{AnisetteClientInfo, remote_v3::RemoteV3AnisetteProvider},
+    auth::apple_account::{AppleAccount, TwoFactorCallbackParams, TwoFactorCallbackResponse},
     dev::{
         app_ids::{AppIdsApi, ListAppIdsResponse},
         certificates::{CertificatesApi, DevelopmentCertificate},
         developer_session::DeveloperSession,
     },
-    sideload::{SideloaderBuilder, builder::MaxCertsBehavior, sideloader::Sideloader},
+    sideload::{
+        SideloaderBuilder,
+        builder::{ExtensionsBehavior, ExtensionsBehaviorSelection, MaxCertsBehavior},
+        sideloader::Sideloader,
+    },
+    util::callbacks::{ExtensionsBehaviorCallbackBox, MaxCertsCallbackBox},
 };
 use keyring::Entry;
+use rootcause::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -32,7 +39,7 @@ pub async fn login_new(
     anisette_server: String,
     save_credentials: bool,
 ) -> Result<(), AppError> {
-    let account = login(&handle, &window, &email, &password, anisette_server).await?;
+    let account = login(&handle, window, &email, &password, anisette_server).await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
     *sideloader_guard = Some(account);
 
@@ -81,7 +88,7 @@ pub async fn login_stored(
     let password = pass_entry.get_password().map_err(|e| {
         AppError::KeyringWithMessage("Failed to get credentials".to_string(), e.to_string())
     })?;
-    let account = login(&handle, &window, &email, &password, anisette_server).await?;
+    let account = login(&handle, window, &email, &password, anisette_server).await?;
     let mut sideloader_guard = sideloader_state.lock().unwrap();
     *sideloader_guard = Some(account);
 
@@ -116,10 +123,9 @@ pub fn delete_account(handle: AppHandle, email: String) -> Result<(), AppError> 
 #[tauri::command]
 pub fn logged_in_as(sideloader_state: State<'_, SideloaderMutex>) -> Option<String> {
     let sideloader_guard = sideloader_state.lock().unwrap();
-    if let Some(account) = &*sideloader_guard {
-        return Some(account.get_email().to_string());
-    }
-    None
+    sideloader_guard
+        .as_ref()
+        .map(|account| account.get_email().to_string())
 }
 
 #[tauri::command]
@@ -155,32 +161,34 @@ pub fn reset_anisette_state() -> Result<bool, AppError> {
 
 async fn login(
     app: &AppHandle,
-    window: &Window,
+    window: Window,
     email: &str,
     password: &str,
     anisette_server: String,
-) -> Result<Sideloader, AppError> {
-    let window_clone = window.clone();
-    let tfa_closure = move || -> Option<String> {
-        window_clone
-            .emit("2fa-required", ())
-            .expect("Failed to emit 2fa-required event");
+) -> Result<Sideloader<MaxCertsCallbackBox, ExtensionsBehaviorCallbackBox>, AppError> {
+    let tfa_closure = {
+        let window_clone = window.clone();
+        move |params: TwoFactorCallbackParams| {
+            let window_clone = window_clone.clone();
 
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        let handler_id = window_clone.listen("2fa-recieved", move |event| {
-            let code = event.payload();
-            let _ = tx.send(code.to_string());
-        });
+            async move {
+                window_clone
+                    .emit("2fa-required", params)
+                    .context("Failed to emit 2fa-required event")?;
 
-        let result = rx.recv_timeout(Duration::from_secs(120));
-        window_clone.unlisten(handler_id);
+                let (tx, rx) = std::sync::mpsc::channel::<String>();
+                let handler_id = window_clone.listen("2fa-recieved", move |event| {
+                    let code = event.payload();
+                    let _ = tx.send(code.to_string());
+                });
 
-        match result {
-            Ok(code) => {
-                let code = code.trim_matches('"').to_string();
-                Some(code)
+                let result = rx.recv_timeout(Duration::from_secs(120))?;
+                window_clone.unlisten(handler_id);
+
+                let code = result.trim_matches('"').to_string();
+                Ok(TwoFactorCallbackResponse::SubmitCode(code))
             }
-            Err(_) => None,
+            .boxed()
         }
     };
 
@@ -195,9 +203,16 @@ async fn login(
             RemoteV3AnisetteProvider::default()?
                 .set_serial_number("0".to_string())
                 .set_storage(create_sideloading_storage(app)?)
+                // just temporary while waiting for the anisette servers to start reporting this
+                .set_client_info_override(Some(AnisetteClientInfo {
+                    client_info:
+                        "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                            .to_string(),
+                    user_agent: "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0".to_string(),
+                }))
                 .set_url(&anisette_url),
         )
-        .login(password, tfa_closure)
+        .login(password, Box::new(tfa_closure))
         .await?;
 
     debug!("Logged in");
@@ -206,42 +221,44 @@ async fn login(
 
     debug!("Created developer session");
 
-    let max_certs_callback = {
-        let window_clone = window.clone();
-        move |certs: &Vec<DevelopmentCertificate>| -> Option<Vec<String>> {
-            let cert_infos: Vec<CertificateInfo> = certs
-                .iter()
-                .map(|cert| CertificateInfo {
-                    name: cert.name.clone(),
-                    certificate_id: cert.certificate_id.clone(),
-                    serial_number: cert.serial_number.clone(),
-                    machine_name: cert.machine_name.clone(),
-                    machine_id: cert.machine_id.clone(),
-                })
-                .collect();
-            window_clone
-                .emit("max-certs-reached", cert_infos)
-                .expect("Failed to emit max-certs-reached event");
+    let max_certs_callback: MaxCertsCallbackBox =
+        Box::new(move |certs: Vec<DevelopmentCertificate>| {
+            let window_clone = window.clone();
+            Box::pin(async move {
+                let cert_infos: Vec<CertificateInfo> = certs
+                    .iter()
+                    .map(|cert| CertificateInfo {
+                        name: cert.name.clone(),
+                        certificate_id: cert.certificate_id.clone(),
+                        serial_number: cert.serial_number.clone(),
+                        machine_name: cert.machine_name.clone(),
+                        machine_id: cert.machine_id.clone(),
+                    })
+                    .collect();
+                window_clone.emit("max-certs-reached", cert_infos)?;
 
-            let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
-            let handler_id = window_clone.listen("max-certs-response", move |event| {
-                let certs = event.payload();
-                let certs = serde_json::from_str::<Option<Vec<String>>>(certs).unwrap_or(None);
-                let _ = tx.send(certs);
-            });
+                let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<String>>>();
+                let handler_id = window_clone.listen("max-certs-response", move |event| {
+                    let certs = event.payload();
+                    let certs = serde_json::from_str::<Option<Vec<String>>>(certs).unwrap_or(None);
+                    let _ = tx.send(certs);
+                });
 
-            let result = rx.recv_timeout(Duration::from_secs(300));
-            window_clone.unlisten(handler_id);
-            result.unwrap_or(None)
-        }
-    };
+                let result = rx.recv_timeout(Duration::from_secs(300));
+                window_clone.unlisten(handler_id);
+                Ok(result?)
+            })
+        });
 
     // TODO: Team Selection
 
     let sideloader = SideloaderBuilder::new(dev_session, email.to_lowercase())
         .machine_name("iloader".into())
         .storage(create_sideloading_storage(app)?)
-        .max_certs_behavior(MaxCertsBehavior::Prompt(Box::new(max_certs_callback)))
+        .extensions_behavior(ExtensionsBehaviorSelection::Fixed(
+            ExtensionsBehavior::ReuseMain,
+        ))
+        .max_certs_behavior(MaxCertsBehavior::Prompt(max_certs_callback))
         .build();
 
     debug!("Built sideloader");
